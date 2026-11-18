@@ -138,7 +138,8 @@ def _robots_groups(robots: str) -> list[tuple[list[str], list[tuple[str, str]]]]
 def blocked_ai_assistants(robots: str) -> list[str]:
     """The AI assistants this robots.txt shuts out of the whole site: every
     crawler they answer with is blocked. A crawler follows its own group if it
-    has one, else ``*``; disallowing one path isn't shutting it out."""
+    has one, else ``*``; disallowing one path isn't shutting it out, and
+    neither is ``Disallow: /`` with any path allowed back."""
     groups = _robots_groups(robots)
 
     def shut_out(token: str) -> bool:
@@ -148,7 +149,7 @@ def blocked_ai_assistants(robots: str) -> list[str]:
             own = [rules for agents, rules in groups if "*" in agents]
         rules = [rule for group in own for rule in group]
         return (any(f == "disallow" and v in _WHOLE_SITE for f, v in rules)
-                and not any(f == "allow" and v in _WHOLE_SITE for f, v in rules))
+                and not any(f == "allow" and v for f, v in rules))
 
     # An assistant still reads the site through any crawler left open.
     assistants = set(AI_ANSWER_CRAWLERS.values())
@@ -1182,11 +1183,13 @@ class ProfileCollector:
     async def _read_sitemap(self, site: str) -> tuple[int, list[str], str]:
         """(page count, lastmod dates, where it was read) for the site's sitemap.
 
-        robots.txt's Sitemap: line comes first, because a stale leftover
-        /sitemap.xml can sit next to the live index. A sitemap index lists
-        sitemaps, not pages, so each one is read and its pages counted. The
-        count is 0 (not recorded) when any of them can't be read: a partial
-        count would tell a prospect their big site is tiny.
+        robots.txt's Sitemap: lines come first, because a stale leftover
+        /sitemap.xml can sit next to the live index, and every one listed is
+        read: a site can split its pages across several. A sitemap index
+        lists sitemaps, not pages, so each one is read and its pages counted.
+        Nothing is recorded when any of them can't be read or there are more
+        than MAX_CHILD_SITEMAPS: a partial count would tell a prospect their
+        big site is tiny, and partial dates that it's stale.
         """
         host = urlparse(site).netloc.lower().removeprefix("www.")
 
@@ -1194,28 +1197,39 @@ class ProfileCollector:
             return urlparse(url).netloc.lower().removeprefix("www.") == host
 
         robots = await self._get(f"{site}/robots.txt")
-        listed = [u for u in re.findall(r"(?im)^\s*sitemap:\s*(\S+)", robots) if same_site(u)]
-        candidates = listed[:1] or [f"{site}/sitemap.xml", f"{site}/sitemap_index.xml",
-                                    f"{site}/wp-sitemap.xml"]
-        for where in candidates:
-            doc = await self._get(where)
-            if "<loc>" not in doc:
-                continue
-            if not re.search(r"<sitemapindex\b", doc, re.I):
-                return (len(re.findall(r"<loc>", doc)),
-                        re.findall(r"<lastmod>\s*(\d{4}-\d{2}-\d{2})", doc), where)
-            children = [u.strip() for u in re.findall(r"<loc>\s*([^<]+)\s*</loc>", doc)]
-            children = [u for u in children if same_site(u)]
-            pages, dates, complete = 0, [], len(children) <= MAX_CHILD_SITEMAPS
-            for child in children[:MAX_CHILD_SITEMAPS]:
-                part = await self._get(child)
-                if "<urlset" not in part:
-                    complete = False
-                    continue
-                pages += len(re.findall(r"<url>", part))
-                dates += re.findall(r"<lastmod>\s*(\d{4}-\d{2}-\d{2})", part)
-            return (pages if complete else 0), dates, where
-        return 0, [], f"{site}/sitemap.xml"
+        listed = list(dict.fromkeys(
+            u for u in re.findall(r"(?im)^\s*sitemap:\s*(\S+)", robots) if same_site(u)))
+        if listed:
+            roots = listed
+        else:
+            roots = []
+            for url in (f"{site}/sitemap.xml", f"{site}/sitemap_index.xml",
+                        f"{site}/wp-sitemap.xml"):
+                if "<loc>" in await self._get(url):
+                    roots = [url]
+                    break
+        if not roots:
+            return 0, [], f"{site}/sitemap.xml"
+
+        pages, dates, queue, read = 0, [], list(roots), 0
+        while queue:
+            url = queue.pop(0)
+            read += 1
+            if read > MAX_CHILD_SITEMAPS + 1:
+                return 0, [], roots[0]
+            doc = await self._get(url)
+            if re.search(r"<sitemapindex\b", doc, re.I):
+                # One level of index only; an index of indexes is no thin site.
+                if url not in roots:
+                    return 0, [], roots[0]
+                children = [u.strip() for u in re.findall(r"<loc>\s*([^<]+)\s*</loc>", doc)]
+                queue += [u for u in children if same_site(u)]
+            elif "<urlset" in doc:
+                pages += len(re.findall(r"<url>", doc))
+                dates += re.findall(r"<lastmod>\s*(\d{4}-\d{2}-\d{2})", doc)
+            else:
+                return 0, [], roots[0]
+        return pages, dates, roots[0]
 
     async def profile_company(self, company_id: str, domain: str) -> list[dict]:
         """Collect every confirmed profile signal for one business."""

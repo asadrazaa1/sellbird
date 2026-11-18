@@ -361,6 +361,33 @@ async def test_unread_child_sitemap_records_no_page_count(state):
     })
     obs = _by_code(await c.profile_company("c1", "acme.example"))
     assert "SITE_PAGE_COUNT" not in obs
+    assert "BLOG_STALE" not in obs, "the unread sitemap may hold the newer pages"
+
+
+@pytest.mark.asyncio
+async def test_every_robots_sitemap_is_counted(state):
+    base = "https://acme.example"
+    c = _sitemap_collector(state, {
+        f"{base}/robots.txt": (f"User-agent: *\nDisallow:\nSitemap: {base}/pages.xml\n"
+                               f"Sitemap: {base}/posts.xml\n"),
+        f"{base}/pages.xml": _urlset(*[(f"{base}/p{i}", "2024-01-01") for i in range(3)]),
+        f"{base}/posts.xml": _urlset(*[(f"{base}/n{i}", "2026-05-01") for i in range(8)]),
+    })
+    obs = _by_code(await c.profile_company("c1", "acme.example"))
+    assert obs["SITE_PAGE_COUNT"]["value_num"] == 11
+    assert obs["BLOG_STALE"]["value_text"] == "newest content 2026-05-01"
+
+
+@pytest.mark.asyncio
+async def test_too_many_sitemaps_records_nothing(state):
+    base = "https://acme.example"
+    children = [f"{base}/s{i}.xml" for i in range(11)]
+    pages = {u: _urlset((f"{u}/a", "2020-01-01")) for u in children[:10]}
+    pages[f"{base}/sitemap.xml"] = _index(*children)
+    c = _sitemap_collector(state, pages)
+    obs = _by_code(await c.profile_company("c1", "acme.example"))
+    assert "SITE_PAGE_COUNT" not in obs
+    assert "BLOG_STALE" not in obs
 
 
 @pytest.mark.asyncio
@@ -406,3 +433,8 @@ def test_whole_site_block_for_everyone_counts():
 def test_own_group_overrides_the_wildcard():
     robots = "User-agent: *\nDisallow: /\n\nUser-agent: OAI-SearchBot\nAllow: /\n"
     assert "ChatGPT" not in blocked_ai_assistants(robots)
+
+
+def test_a_path_allowed_back_is_not_a_block():
+    robots = "User-agent: *\nDisallow: /\nAllow: /blog/\n"
+    assert blocked_ai_assistants(robots) == []
